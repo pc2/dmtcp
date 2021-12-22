@@ -136,6 +136,7 @@ static void restart_fast_path(void);
 static void restart_slow_path(void);
 static int doAreasOverlap(VA addr1, size_t size1, VA addr2, size_t size2);
 static int hasOverlappingMapping(VA addr, size_t size);
+static int mremap_move(void *dest, void *src, size_t size);
 static void remapMtcpRestartToReservedArea(RestoreInfo *rinfo);
 static void mtcp_simulateread(int fd, MtcpHeader *mtcpHdr);
 void restore_libc(ThreadTLSInfo *tlsInfo, int tls_pid_offset,
@@ -726,85 +727,59 @@ static void unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo)
   }
 
   // Check for overlap between newer and older vDSO/vvar sections.
-  if (doAreasOverlap(vdsoStart, vdsoEnd - vdsoStart,
+  if (
+#if 0
+      doAreasOverlap(vdsoStart, vdsoEnd - vdsoStart,
                      rinfo->vdsoStart, rinfo->vdsoEnd - rinfo->vdsoStart) ||
       doAreasOverlap(vdsoStart, vdsoEnd - vdsoStart,
                      rinfo->vvarStart, rinfo->vvarEnd - rinfo->vvarStart) ||
       doAreasOverlap(vvarStart, vvarEnd - vvarStart,
                      rinfo->vdsoStart, rinfo->vdsoEnd - rinfo->vdsoStart) ||
       doAreasOverlap(vdsoStart, vdsoEnd - vdsoStart,
-                     rinfo->vvarStart, rinfo->vvarEnd - rinfo->vvarStart)) {
-    MTCP_PRINTF("*** MTCP Error: Overlapping addresses for older and newer\n"
+                     rinfo->vvarStart, rinfo->vvarEnd - rinfo->vvarStart)
+#else
+      // We will move vvar first, if original vvar doesn't overlap with
+      // current vdso,  After that, it should be possible to move vdso to its
+      // original position.
+      doAreasOverlap(rinfo->vvarStart, vvarEnd - vvarStart,
+                     vdsoStart, vdsoEnd - vdsoStart)
+#endif
+     ) // FIXME:  We can temporarily move vvar or vdso to a third,
+       //         non-conflicting location, if a future kernel causes
+       //         this error condition to happen.
+  { MTCP_PRINTF("*** MTCP Error: Overlapping addresses for older and newer\n"
                 "                vDSO/vvar sections.\n"
                 "      vdsoStart: %p vdsoEnd: %p vvarStart: %p vvarEnd: %p\n"
-                "rinfo:vdsoStart: %p vdsoEnd: %p vvarStart: %p vvarEnd: %p\n",
-                vdsoStart, vdsoEnd, vvarStart, vvarEnd,
-                rinfo->vdsoStart, rinfo->vdsoEnd, rinfo->vvarStart, rinfo->vvarEnd);
+                "rinfo:vdsoStart: %p vdsoEnd: %p vvarStart: %p vvarEnd: %p\n"
+                "(SEE FIXME comment in source code for how to fix this.)\n",
+                vdsoStart,
+                vdsoEnd,
+                vvarStart,
+                vvarEnd,
+                rinfo->vdsoStart,
+                rinfo->vdsoEnd,
+                rinfo->vvarStart,
+                rinfo->vvarEnd);
     mtcp_abort();
   }
 
-  if (vdsoStart != NULL) {
-    void *vdso = mtcp_sys_mremap(vdsoStart,
-                                 vdsoEnd - vdsoStart,
-                                 vdsoEnd - vdsoStart,
-                                 MREMAP_FIXED | MREMAP_MAYMOVE,
-                                 rinfo->vdsoStart);
-    if (vdso == MAP_FAILED) {
-      MTCP_PRINTF("***Error: failed to mremap vdso; errno: %d.\n", mtcp_sys_errno);
-      mtcp_abort();
-    }
-    MTCP_ASSERT(vdso == rinfo->vdsoStart);
-
-#if defined(__i386__)
-    // In commit dec2c26c1eb13eb1c12edfdc9e8e811e4cc0e3c2 , the mremap
-    //   code above was added, and then caused a segfault on restart for
-    //   __i386__ in CentOS 7.  In that case ENABLE_VDSO_CHECK was not defined.
-    //   This version was needed in that commit for __i386__
-    //   (i.e., for multi-arch.sh) to succeed.
-    // Newer Linux kernels, such as __x86_64__, provide a separate vsyscall segment
-    //   for kernel calls while using vdso for system calls that can be
-    //   executed purely in user space through kernel-specific user-space code.
-    // On older kernels like __x86__, both purposes are squeezed into vdso.
-    //   Since vdso will use randomized addresses (unlike the standard practice
-    //   for vsyscall), this implies that kernel calls on __x86__ can go through
-    //   randomized addresses, and so they need special treatment.
-    vdso = mtcp_sys_mmap(vdsoStart, vdsoEnd - vdsoStart,
-                         PROT_EXEC | PROT_WRITE | PROT_READ,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-    // The new vdso was remapped to the location of the old vdso, since the
-    //   restarted application code remembers the old vdso address.
-    //   But for __i386__, a kernel call will go through the old vdso address
-    //   into the kernel, and then the kernel will return to the new vdso address
-    //   that was created by this kernel.  So, we need to copy the new vdso
-    //   code from its current location at the old vdso address back into
-    //   the new vdso address that was just mmap'ed.
-    if (vdso == MAP_FAILED) {
-      MTCP_PRINTF("***Error: failed to mremap vdso; errno: %d\n", mtcp_sys_errno);
-      mtcp_abort();
-    }
-    MTCP_ASSERT(vdso == vdsoStart);
-    mtcp_memcpy(vdsoStart, rinfo->vdsoStart, vdsoEnd - vdsoStart);
-#endif
-  }
-
+  // Move vvar to original location, followed by same for vdso
   if (vvarStart != NULL) {
-    void *vvar = mtcp_sys_mremap(vvarStart,
-                                 vvarEnd - vvarStart,
-                                 vvarEnd - vvarStart,
-                                 MREMAP_FIXED | MREMAP_MAYMOVE,
-                                 rinfo->vvarStart);
-    if (vvar == MAP_FAILED) {
-      MTCP_PRINTF("***Error: failed to mremap vvar; errno: %d.\n", mtcp_sys_errno);
+    int rc = mremap_move(rinfo->vvarStart, vvarStart, vvarEnd - vvarStart);
+    if (rc == -1) {
+      MTCP_PRINTF("***Error: failed to remap vvarStart to old value "
+                  "%p -> %p); errno: %d.\n",
+                  vvarStart, rinfo->vvarStart, mtcp_sys_errno);
       mtcp_abort();
     }
-    MTCP_ASSERT(vvar == rinfo->vvarStart);
-
 #if defined(__i386__)
+    // FIXME: For clarity of code, move this i386-specific code toa function.
     vvar = mtcp_sys_mmap(vvarStart, vvarEnd - vvarStart,
                          PROT_EXEC | PROT_WRITE | PROT_READ,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
     if (vvar == MAP_FAILED) {
-      MTCP_PRINTF("***Error: failed to mremap vvar; errno: %d\n", mtcp_sys_errno);
+      MTCP_PRINTF("***Error: failed to mremap vvar; errno: %d\n",
+                  mtcp_sys_errno);
       mtcp_abort();
     }
     MTCP_ASSERT(vvar == vvarStart);
@@ -816,7 +791,51 @@ static void unmap_memory_areas_and_restore_vdso(RestoreInfo *rinfo)
     // version 4.0
     // TODO: Find a way to automatically detect the readable bytes.
     mtcp_memcpy(vvarStart, rinfo->vvarStart, MTCP_PAGE_SIZE);
-#endif
+#endif /* if defined(__i386__) */
+  }
+
+  if (vdsoStart != NULL) {
+    int rc = mremap_move(rinfo->vdsoStart, vdsoStart, vdsoEnd - vdsoStart);
+    if (rc == -1) {
+      MTCP_PRINTF("***Error: failed to remap vdsoStart to old value "
+                  "%p -> %p); errno: %d.\n",
+                  vdsoStart, rinfo->vdsoStart, mtcp_sys_errno);
+      mtcp_abort();
+    }
+#if defined(__i386__)
+    // FIXME: For clarity of code, move this i386-specific code toa function.
+    // In commit dec2c26c1eb13eb1c12edfdc9e8e811e4cc0e3c2 , the mremap
+    // code above was added, and then caused a segfault on restart for
+    // __i386__ in CentOS 7.  In that case ENABLE_VDSO_CHECK was not defined.
+    // This version was needed in that commit for __i386__
+    // (i.e., for multi-arch.sh) to succeed.
+    // Newer Linux kernels, such as __x86_64__, provide a separate vsyscall
+    // segment
+    // for kernel calls while using vdso for system calls that can be
+    // executed purely in user space through kernel-specific user-space code.
+    // On older kernels like __x86__, both purposes are squeezed into vdso.
+    // Since vdso will use randomized addresses (unlike the standard practice
+    // for vsyscall), this implies that kernel calls on __x86__ can go through
+    // randomized addresses, and so they need special treatment.
+    vdso = mtcp_sys_mmap(vdsoStart, vdsoEnd - vdsoStart,
+                         PROT_EXEC | PROT_WRITE | PROT_READ,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+
+    // The new vdso was remapped to the location of the old vdso, since the
+    // restarted application code remembers the old vdso address.
+    // But for __i386__, a kernel call will go through the old vdso address
+    // into the kernel, and then the kernel will return to the new vdso address
+    // that was created by this kernel.  So, we need to copy the new vdso
+    // code from its current location at the old vdso address back into
+    // the new vdso address that was just mmap'ed.
+    if (vdso == MAP_FAILED) {
+      MTCP_PRINTF("***Error: failed to mremap vdso; errno: %d\n",
+                  mtcp_sys_errno);
+      mtcp_abort();
+    }
+    MTCP_ASSERT(vdso == vdsoStart);
+    mtcp_memcpy(vdsoStart, rinfo->vdsoStart, vdsoEnd - vdsoStart);
+#endif /* if defined(__i386__) */
   }
 }
 
@@ -1188,6 +1207,33 @@ static int hasOverlappingMapping(VA addr, size_t size)
   }
   mtcp_sys_close (mapsfd);
   return ret;
+}
+
+/* This uses MREMAP_FIXED | MREMAP_MAYMOVE to move a memory segment.
+ * Note that we need 'MREMAP_MAYMOVE'.  With only 'MREMAP_FIXED', the
+ * kernel can overwrite an existing memory region.
+ */
+NO_OPTIMIZE
+static int
+mremap_move(void *dest, void *src, size_t size) {
+  int mtcp_sys_errno;
+  if (dest == src) {
+    return 0; // Success
+  }
+  void *rc = mtcp_sys_mremap(src, size, size, MREMAP_FIXED | MREMAP_MAYMOVE,
+                               dest);
+  if (rc == dest) {
+    return 0; // Success
+  } else if (rc == MAP_FAILED) {
+    MTCP_PRINTF("***Error: failed to mremap; errno: %d.\n",
+                mtcp_sys_errno);
+    return -1; // Error
+  } else {
+    // Else 'MREMAP_MAYMOVE' forced the remap to the wrong location.  So, the
+    // memory was moved to the wrong desgination.  Undo the move, and return -1.
+    mremap_move(src, rc, size);
+    return -1; // Error
+  }
 }
 
 // This is the entrypoint to the binary. We'll need it for adding symbol file.
