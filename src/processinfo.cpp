@@ -101,7 +101,7 @@ void dmtcp_ProcessInfo_EventHook(DmtcpEvent_t event, DmtcpEventData_t *data)
           getrlimit(_RLIMIT, &rlim); \
           JWARNING(_rlim_cur <= rlim.rlim_max) (_rlim_cur) (rlim.rlim_max) \
             .Text("Prev. soft limit of " #_RLIMIT " lowered to new hard limit"); \
-          rlim.rlim_cur = _rlim_cur; \
+          rlim.rlim_cur = ( _rlim_cur <= rlim.rlim_max )? _rlim_cur : rlim.rlim_max; \
           JASSERT(setrlimit(_RLIMIT, &rlim) == 0)(JASSERT_ERRNO); \
         }
 
